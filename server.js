@@ -37,18 +37,35 @@ const upload = multer({
   limits: { fileSize: 1.5 * 1024 * 1024 * 1024 }, // 1.5GB limit
 });
 
-// Convert PNG to WebP with quality optimization
-async function convertToWebP(buffer, quality = 90) {
+// Convert PNG to WebP with quality optimization (lightweight)
+async function convertToWebP(buffer, quality = 70) {
   if (quality < 10) {
     throw new Error("Could not compress image under 2MB");
   }
 
-  const webpBuffer = await sharp(buffer)
-    .webp({ quality: quality, lossless: false })
+  // Resize large images to reduce memory usage
+  let sharp_instance = sharp(buffer);
+
+  const metadata = await sharp_instance.metadata();
+
+  // If image is very large, resize it first
+  if (metadata.width > 2048 || metadata.height > 2048) {
+    sharp_instance = sharp_instance.resize(2048, 2048, {
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+  }
+
+  const webpBuffer = await sharp_instance
+    .webp({
+      quality: quality,
+      lossless: false,
+      effort: 1, // Fastest compression (uses less CPU)
+    })
     .toBuffer();
 
   if (webpBuffer.length > maxSize) {
-    return convertToWebP(buffer, quality - 10);
+    return convertToWebP(buffer, quality - 15);
   }
 
   return webpBuffer;
@@ -362,9 +379,12 @@ async function processFilesAsync(jobId, fileBuffer) {
               global.gc();
             }
 
-            // Small delay every 5 files to prevent overwhelming the system
-            if (processedPngs % 5 === 0) {
-              await new Promise((resolve) => setTimeout(resolve, 50));
+            // Longer delay every file to prevent overwhelming the system
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            // Force memory cleanup after each file
+            if (global.gc) {
+              global.gc();
             }
           } catch (conversionError) {
             console.error(
