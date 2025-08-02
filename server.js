@@ -170,7 +170,10 @@ app.post("/convert-and-zip", async (req, res) => {
   }
 });
 
-// Recursive folder structure conversion endpoint
+// Async processing with job tracking
+const processingJobs = new Map();
+
+// Start conversion job (async)
 app.post(
   "/convert-folder-structure",
   upload.single("zipFile"),
@@ -180,97 +183,214 @@ app.post(
         return res.status(400).json({ error: "No zip file uploaded" });
       }
 
-      // Create temporary directories for processing
-      const tempDir = path.join(__dirname, "temp", Date.now().toString());
-      const extractDir = path.join(tempDir, "extracted");
-      const outputDir = path.join(tempDir, "output");
+      const jobId = Date.now().toString();
 
-      fs.mkdirSync(extractDir, { recursive: true });
-      fs.mkdirSync(outputDir, { recursive: true });
+      // Immediately return job ID
+      res.json({
+        jobId: jobId,
+        status: "processing",
+        message: "Conversion started. Use /status endpoint to check progress.",
+      });
 
-      try {
-        // Extract uploaded zip file
-        const zip = new AdmZip(req.file.buffer);
-        zip.extractAllTo(extractDir, true);
-
-        // Function to recursively find PNG files and convert them
-        async function processDirectory(sourceDir, outputDir) {
-          const items = fs.readdirSync(sourceDir);
-
-          for (const item of items) {
-            const sourcePath = path.join(sourceDir, item);
-            const outputPath = path.join(outputDir, item);
-            const stat = fs.statSync(sourcePath);
-
-            if (stat.isDirectory()) {
-              // Create directory in output and recurse
-              fs.mkdirSync(outputPath, { recursive: true });
-              await processDirectory(sourcePath, outputPath);
-            } else if (
-              stat.isFile() &&
-              path.extname(item).toLowerCase() === ".png"
-            ) {
-              // Convert PNG to WebP
-              const fileBuffer = fs.readFileSync(sourcePath);
-              const webpBuffer = await convertToWebP(fileBuffer);
-              const webpFileName = path.parse(item).name + ".webp";
-              const webpPath = path.join(outputDir, webpFileName);
-              fs.writeFileSync(webpPath, webpBuffer);
-              console.log(`Converted: ${sourcePath} -> ${webpPath}`);
-            } else {
-              // Copy non-PNG files as-is
-              fs.copyFileSync(sourcePath, outputPath);
-            }
-          }
-        }
-
-        // Process the extracted directory
-        await processDirectory(extractDir, outputDir);
-
-        // Create output zip
-        const outputZip = new AdmZip();
-
-        // Function to add directory to zip recursively
-        function addDirectoryToZip(dirPath, zipPath = "") {
-          const items = fs.readdirSync(dirPath);
-
-          for (const item of items) {
-            const itemPath = path.join(dirPath, item);
-            const zipItemPath = path.join(zipPath, item);
-            const stat = fs.statSync(itemPath);
-
-            if (stat.isDirectory()) {
-              addDirectoryToZip(itemPath, zipItemPath);
-            } else {
-              outputZip.addLocalFile(itemPath, zipPath);
-            }
-          }
-        }
-
-        addDirectoryToZip(outputDir);
-
-        const zipBuffer = outputZip.toBuffer();
-
-        // Set response headers for zip download
-        res.set({
-          "Content-Type": "application/zip",
-          "Content-Disposition": 'attachment; filename="converted_images.zip"',
-          "Content-Length": zipBuffer.length,
-        });
-
-        res.send(zipBuffer);
-      } finally {
-        // Clean up temporary files
-        if (fs.existsSync(tempDir)) {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        }
-      }
+      // Process asynchronously
+      processFilesAsync(jobId, req.file.buffer);
     } catch (error) {
-      console.error("Folder structure conversion error:", error);
+      console.error("Job creation error:", error);
       res.status(500).json({ error: error.message });
     }
   }
 );
+
+// Check job status
+app.get("/status/:jobId", (req, res) => {
+  const jobId = req.params.jobId;
+  const job = processingJobs.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  res.json(job);
+});
+
+// Download completed file
+app.get("/download/:jobId", (req, res) => {
+  const jobId = req.params.jobId;
+  const job = processingJobs.get(jobId);
+
+  if (!job || job.status !== "completed") {
+    return res.status(404).json({ error: "File not ready" });
+  }
+
+  try {
+    const zipBuffer = fs.readFileSync(job.outputPath);
+
+    res.set({
+      "Content-Type": "application/zip",
+      "Content-Disposition": 'attachment; filename="converted_images.zip"',
+      "Content-Length": zipBuffer.length,
+    });
+
+    res.send(zipBuffer);
+
+    // Clean up after download
+    setTimeout(() => {
+      processingJobs.delete(jobId);
+      if (fs.existsSync(job.tempDir)) {
+        fs.rmSync(job.tempDir, { recursive: true, force: true });
+      }
+    }, 5000);
+  } catch (error) {
+    res.status(500).json({ error: "Download failed" });
+  }
+});
+
+// Async processing function
+async function processFilesAsync(jobId, fileBuffer) {
+  const tempDir = path.join(__dirname, "temp", jobId);
+  const extractDir = path.join(tempDir, "extracted");
+  const outputDir = path.join(tempDir, "output");
+  const outputZipPath = path.join(tempDir, "converted.zip");
+
+  try {
+    // Update job status
+    processingJobs.set(jobId, {
+      status: "extracting",
+      progress: 0,
+      tempDir: tempDir,
+      outputPath: outputZipPath,
+    });
+
+    fs.mkdirSync(extractDir, { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    // Extract zip
+    const zip = new AdmZip(fileBuffer);
+    zip.extractAllTo(extractDir, true);
+
+    processingJobs.set(jobId, {
+      status: "converting",
+      progress: 10,
+      tempDir: tempDir,
+      outputPath: outputZipPath,
+    });
+
+    // Count total PNG files for progress tracking
+    let totalPngs = 0;
+    let processedPngs = 0;
+
+    function countPngs(dir) {
+      const items = fs.readdirSync(dir);
+      for (const item of items) {
+        const itemPath = path.join(dir, item);
+        const stat = fs.statSync(itemPath);
+        if (stat.isDirectory()) {
+          countPngs(itemPath);
+        } else if (path.extname(item).toLowerCase() === ".png") {
+          totalPngs++;
+        }
+      }
+    }
+
+    countPngs(extractDir);
+
+    // Process directory with progress updates
+    async function processDirectory(sourceDir, outputDir) {
+      const items = fs.readdirSync(sourceDir);
+
+      for (const item of items) {
+        const sourcePath = path.join(sourceDir, item);
+        const outputPath = path.join(outputDir, item);
+        const stat = fs.statSync(sourcePath);
+
+        if (stat.isDirectory()) {
+          fs.mkdirSync(outputPath, { recursive: true });
+          await processDirectory(sourcePath, outputPath);
+        } else if (
+          stat.isFile() &&
+          path.extname(item).toLowerCase() === ".png"
+        ) {
+          const fileBuffer = fs.readFileSync(sourcePath);
+          const webpBuffer = await convertToWebP(fileBuffer);
+          const webpFileName = path.parse(item).name + ".webp";
+          const webpPath = path.join(outputDir, webpFileName);
+          fs.writeFileSync(webpPath, webpBuffer);
+
+          processedPngs++;
+          const progress = Math.min(
+            90,
+            10 + Math.floor((processedPngs / totalPngs) * 70)
+          );
+
+          processingJobs.set(jobId, {
+            status: "converting",
+            progress: progress,
+            processedFiles: processedPngs,
+            totalFiles: totalPngs,
+            tempDir: tempDir,
+            outputPath: outputZipPath,
+          });
+
+          console.log(
+            `[${jobId}] Converted ${processedPngs}/${totalPngs}: ${item}`
+          );
+        } else {
+          fs.copyFileSync(sourcePath, outputPath);
+        }
+      }
+    }
+
+    await processDirectory(extractDir, outputDir);
+
+    // Create zip
+    processingJobs.set(jobId, {
+      status: "zipping",
+      progress: 90,
+      tempDir: tempDir,
+      outputPath: outputZipPath,
+    });
+
+    const outputZip = new AdmZip();
+
+    function addDirectoryToZip(dirPath, zipPath = "") {
+      const items = fs.readdirSync(dirPath);
+      for (const item of items) {
+        const itemPath = path.join(dirPath, item);
+        const stat = fs.statSync(itemPath);
+        if (stat.isDirectory()) {
+          addDirectoryToZip(itemPath, path.join(zipPath, item));
+        } else {
+          outputZip.addLocalFile(itemPath, zipPath);
+        }
+      }
+    }
+
+    addDirectoryToZip(outputDir);
+    outputZip.writeZip(outputZipPath);
+
+    // Mark as completed
+    processingJobs.set(jobId, {
+      status: "completed",
+      progress: 100,
+      processedFiles: processedPngs,
+      totalFiles: totalPngs,
+      tempDir: tempDir,
+      outputPath: outputZipPath,
+      downloadUrl: `/download/${jobId}`,
+    });
+
+    console.log(
+      `[${jobId}] Conversion completed: ${processedPngs} files processed`
+    );
+  } catch (error) {
+    console.error(`[${jobId}] Processing error:`, error);
+    processingJobs.set(jobId, {
+      status: "failed",
+      error: error.message,
+      tempDir: tempDir,
+    });
+  }
+}
 
 // Error handling middleware
 app.use((error, req, res, next) => {
