@@ -185,18 +185,23 @@ app.post(
 
       const jobId = Date.now().toString();
 
-      // Immediately return job ID
+      // Immediately return job ID and end response
       res.json({
         jobId: jobId,
         status: "processing",
         message: "Conversion started. Use /status endpoint to check progress.",
       });
+      res.end();
 
-      // Process asynchronously
-      processFilesAsync(jobId, req.file.buffer);
+      // Process asynchronously with small delay to ensure response is sent
+      setImmediate(() => {
+        processFilesAsync(jobId, req.file.buffer);
+      });
     } catch (error) {
       console.error("Job creation error:", error);
-      res.status(500).json({ error: error.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message });
+      }
     }
   }
 );
@@ -211,6 +216,22 @@ app.get("/status/:jobId", (req, res) => {
   }
 
   res.json(job);
+});
+
+// List all active jobs (for monitoring)
+app.get("/jobs", (req, res) => {
+  const jobs = Array.from(processingJobs.entries()).map(([id, job]) => ({
+    jobId: id,
+    status: job.status,
+    progress: job.progress,
+    processedFiles: job.processedFiles || 0,
+    totalFiles: job.totalFiles || 0,
+  }));
+  res.json({
+    activeJobs: jobs.length,
+    jobs: jobs,
+    memoryUsage: process.memoryUsage(),
+  });
 });
 
 // Download completed file
@@ -310,30 +331,48 @@ async function processFilesAsync(jobId, fileBuffer) {
           stat.isFile() &&
           path.extname(item).toLowerCase() === ".png"
         ) {
-          const fileBuffer = fs.readFileSync(sourcePath);
-          const webpBuffer = await convertToWebP(fileBuffer);
-          const webpFileName = path.parse(item).name + ".webp";
-          const webpPath = path.join(outputDir, webpFileName);
-          fs.writeFileSync(webpPath, webpBuffer);
+          try {
+            const fileBuffer = fs.readFileSync(sourcePath);
+            const webpBuffer = await convertToWebP(fileBuffer);
+            const webpFileName = path.parse(item).name + ".webp";
+            const webpPath = path.join(outputDir, webpFileName);
+            fs.writeFileSync(webpPath, webpBuffer);
 
-          processedPngs++;
-          const progress = Math.min(
-            90,
-            10 + Math.floor((processedPngs / totalPngs) * 70)
-          );
+            processedPngs++;
+            const progress = Math.min(
+              90,
+              10 + Math.floor((processedPngs / totalPngs) * 70)
+            );
 
-          processingJobs.set(jobId, {
-            status: "converting",
-            progress: progress,
-            processedFiles: processedPngs,
-            totalFiles: totalPngs,
-            tempDir: tempDir,
-            outputPath: outputZipPath,
-          });
+            processingJobs.set(jobId, {
+              status: "converting",
+              progress: progress,
+              processedFiles: processedPngs,
+              totalFiles: totalPngs,
+              tempDir: tempDir,
+              outputPath: outputZipPath,
+            });
 
-          console.log(
-            `[${jobId}] Converted ${processedPngs}/${totalPngs}: ${item}`
-          );
+            console.log(
+              `[${jobId}] Converted ${processedPngs}/${totalPngs}: ${item}`
+            );
+
+            // Force garbage collection hints for memory management
+            if (processedPngs % 3 === 0 && global.gc) {
+              global.gc();
+            }
+
+            // Small delay every 5 files to prevent overwhelming the system
+            if (processedPngs % 5 === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+          } catch (conversionError) {
+            console.error(
+              `[${jobId}] Failed to convert ${item}:`,
+              conversionError.message
+            );
+            // Continue with other files
+          }
         } else {
           fs.copyFileSync(sourcePath, outputPath);
         }
@@ -389,6 +428,15 @@ async function processFilesAsync(jobId, fileBuffer) {
       error: error.message,
       tempDir: tempDir,
     });
+
+    // Clean up on error
+    try {
+      if (fs.existsSync(tempDir)) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    } catch (cleanupError) {
+      console.error(`[${jobId}] Cleanup error:`, cleanupError);
+    }
   }
 }
 
